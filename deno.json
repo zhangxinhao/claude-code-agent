@@ -1,12 +1,17 @@
 {
   "name": "@ora-space/claude-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "exports": "./src/main.ts",
+  "imports": {
+    "@ora-space/plugin-sdk": "jsr:@ora-space/plugin-sdk@^1.0.0",
+    "@ora-space/plugin-sdk/": "jsr:@ora-space/plugin-sdk@^1.0.0/"
+  },
+  "lock": true,
   "tasks": {
-    "check": "deno check src/main.ts tests/host-simulator.ts",
-    "lint": "deno lint src vendor tests",
-    "format": "deno fmt src vendor tests deno.json package.json README.md",
-    "simulate": "deno run --allow-run --allow-read --allow-env --allow-net tests/host-simulator.ts",
+    "check": "deno check src/main.ts tests/*.ts",
+    "lint": "deno lint src tests",
+    "format": "deno fmt src tests deno.json package.json README.md",
+    "simulate": "deno test --allow-run --allow-read --allow-env --allow-net tests/",
     "dev": "deno run --no-prompt --allow-run --allow-read --allow-env --allow-net src/main.ts"
   },
   "compilerOptions": {

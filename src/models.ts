@@ -1,4 +1,4 @@
-import type { AgentModel } from "../../vendor/plugin-sdk/mod.ts";
+import type { AgentModel } from "@ora-space/plugin-sdk/agent";
 
 /**
  * Serves `agent/listModels` with an empty list, because Claude Code has no pre-session model list.
