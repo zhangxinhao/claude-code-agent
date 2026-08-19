@@ -1,0 +1,25 @@
+{
+  "name": "@ora-space/claude-agent",
+  "version": "0.1.0",
+  "description": "Ora agent plugin that runs Claude Code as an ACP agent.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "ora": {
+    "manifestVersion": 1,
+    "id": "ora-space.claude",
+    "displayName": "Claude Code",
+    "kind": "agent",
+    "main": "./src/main.ts",
+    "engines": {
+      "ora": ">= 0.8.0",
+      "pluginApi": 1,
+      "bun": ">= 1.0.0"
+    },
+    "contributes": {
+      "agent": {
+        "displayName": "Claude Code",
+        "contractVersion": 1
+      }
+    }
+  }
+}
