@@ -3,7 +3,7 @@ import type {
   AgentModel,
   AgentStartContext,
   JsonValue,
-} from "../vendor/plugin-sdk/mod.ts";
+} from "@ora-space/plugin-sdk";
 import {
   AgentPlugin,
   type PluginContext,

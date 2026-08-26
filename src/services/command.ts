@@ -1,7 +1,4 @@
-import {
-  AGENT_NOT_INSTALLED,
-  PluginMethodError,
-} from "../../vendor/plugin-sdk/mod.ts";
+import { AGENT_NOT_INSTALLED, PluginMethodError } from "@ora-space/plugin-sdk";
 
 /** The npm bin name of the ACP adapter that fronts Claude Code. */
 const BINARY_NAME = "claude-agent-acp";

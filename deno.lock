@@ -1,0 +1,16 @@
+{
+  "version": "5",
+  "specifiers": {
+    "jsr:@ora-space/plugin-sdk@0.3.0": "0.3.0"
+  },
+  "jsr": {
+    "@ora-space/plugin-sdk@0.3.0": {
+      "integrity": "3c6f54c5c2116f412ceefd65332c592d8637af16019cf635e6a78e5470aac42f"
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@ora-space/plugin-sdk@0.3.0"
+    ]
+  }
+}

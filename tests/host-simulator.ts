@@ -4,11 +4,73 @@
  * Run it with the same permissions Ora grants an agent plugin:
  *   deno run --allow-run --allow-read --allow-env --allow-net tests/host-simulator.ts
  */
-import {
-  decodeFrames,
-  encodeFrame,
-  type JsonValue,
-} from "../vendor/plugin-sdk/protocol.ts";
+const JSON_RPC_FRAME_TYPE = 0x01;
+const MAX_FRAME_LENGTH = 16 * 1024 * 1024;
+
+type JsonValue = null | boolean | number | string | JsonValue[] | {
+  [key: string]: JsonValue;
+};
+
+/**
+ * Encodes and decodes Ora's binary JSON-RPC frame envelope.
+ *
+ * This is a standalone reimplementation of the wire format, not an import from the plugin SDK:
+ * this file plays the host's side of the protocol, and the host does not depend on the SDK it is
+ * exercising.
+ */
+
+/** Encodes one JSON value into Ora's binary JSON-RPC frame envelope. */
+function encodeFrame(message: JsonValue): Uint8Array {
+  const payload = new TextEncoder().encode(JSON.stringify(message));
+  const length = payload.byteLength + 1;
+  if (length > MAX_FRAME_LENGTH) {
+    throw new Error(`Plugin frame exceeds ${MAX_FRAME_LENGTH} bytes`);
+  }
+
+  const frame = new Uint8Array(length + 4);
+  new DataView(frame.buffer).setUint32(0, length, false);
+  frame[4] = JSON_RPC_FRAME_TYPE;
+  frame.set(payload, 5);
+  return frame;
+}
+
+/** Decodes arbitrarily fragmented bytes into complete JSON-RPC messages. */
+async function* decodeFrames(
+  readable: ReadableStream<Uint8Array>,
+): AsyncGenerator<unknown> {
+  let buffer = new Uint8Array();
+  for await (const chunk of readable) {
+    const combined = new Uint8Array(buffer.byteLength + chunk.byteLength);
+    combined.set(buffer);
+    combined.set(chunk, buffer.byteLength);
+    buffer = combined;
+
+    while (buffer.byteLength >= 4) {
+      const length = new DataView(
+        buffer.buffer,
+        buffer.byteOffset,
+        buffer.byteLength,
+      ).getUint32(0, false);
+      if (length < 1 || length > MAX_FRAME_LENGTH) {
+        throw new Error(`Invalid plugin frame length ${length}`);
+      }
+      if (buffer.byteLength < length + 4) {
+        break;
+      }
+      if (buffer[4] !== JSON_RPC_FRAME_TYPE) {
+        throw new Error(`Unsupported plugin frame type ${buffer[4]}`);
+      }
+
+      const payload = buffer.slice(5, length + 4);
+      buffer = buffer.slice(length + 4);
+      yield JSON.parse(new TextDecoder().decode(payload));
+    }
+  }
+
+  if (buffer.byteLength !== 0) {
+    throw new Error("Plugin protocol stream ended inside a frame");
+  }
+}
 
 const HOST_PERMISSIONS = [
   "--no-prompt",

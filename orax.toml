@@ -1,0 +1,9 @@
+resolver = 1
+title = "Claude Code"
+identifier = "ora-space.claude"
+namespace = "official"
+kind = "agent"
+version = "0.1.0"
+description = "Ora Space Claude Code Agent"
+homepage = "https://github.com/ora-space/claude-code-agent"
+license = "Apache-2.0"

@@ -1,10 +1,11 @@
 import {
   type AcpSender,
+  type AgentEffectDefinition,
   type AgentModel,
   type AgentStartContext,
   defineAgent,
   type JsonValue,
-} from "../../vendor/plugin-sdk/mod.ts";
+} from "@ora-space/plugin-sdk";
 
 /**
  * Carries the process-level facts a plugin instance may need outside any agent session.
@@ -77,6 +78,16 @@ export abstract class AgentPlugin {
 
   /** [agent/stop] Terminates the agent while leaving this plugin process alive. */
   onStop(): void | Promise<void> {}
+
+  /**
+   * Declares Agent Effect surfaces this plugin consumes and coordinates their safe mutation.
+   *
+   * `undefined` opts the plugin out of the Effect contract entirely, which is the default for a
+   * plugin with nothing Ora manages on disk. A plugin that owns one sets this to a value serving
+   * `effect/waitForIdle` and `effect/restart`, typically by mounting a handler module the same
+   * way `onStart` and friends are mounted above.
+   */
+  effects: AgentEffectDefinition | undefined = undefined;
 }
 
 /** One entry of the flattened dispatch table, already bound to its plugin instance. */
@@ -112,6 +123,7 @@ export async function runAgentPlugin(
       invoke(routes, AGENT_NOTIFICATION_ROUTES.onAcp, frame) as
         | void
         | Promise<void>,
+    effects: plugin.effects,
   });
 
   try {
