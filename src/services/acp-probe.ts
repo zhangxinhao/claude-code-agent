@@ -1,0 +1,244 @@
+import type { HostChildProcess, JsonValue } from "@ora-space/plugin-sdk";
+import { METHOD_NOT_FOUND } from "@ora-space/plugin-sdk";
+import { decodeLines, encodeLine } from "./ndjson.ts";
+
+/**
+ * How long one whole probe conversation may take before it is abandoned.
+ *
+ * Ora allows `agent/list_models` 60 seconds, and a probe has to spawn the adapter and complete an
+ * ACP handshake inside that. The budget covers the conversation rather than each request, so a
+ * slow `initialize` cannot be followed by an equally slow `session/new` and overrun the host's own
+ * deadline — which would fail discovery with a timeout naming the host instead of the adapter.
+ */
+const PROBE_BUDGET_MS = 40_000;
+
+/** One probe request still waiting for the adapter's answer, keyed by its JSON-RPC id. */
+interface PendingCall {
+  resolve: (result: JsonValue) => void;
+  reject: (error: Error) => void;
+}
+
+/** A probe conversation that ended without the answer it asked for. */
+export class AcpProbeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AcpProbeError";
+  }
+}
+
+/**
+ * Speaks ACP to one short-lived adapter process the plugin questions and then discards.
+ *
+ * This is deliberately not the live bridge in the `*-client.ts` sibling. That one is a pipe: Ora
+ * owns both ends of the conversation and this plugin never injects a request of its own into it.
+ * A probe is the opposite — this plugin is the ACP *client*, asking a question Ora knows nothing
+ * about — so it needs its own request/response correlation and, above all, its own process. A
+ * request injected into the connection Ora is reading would return its answer down Ora's pipe, and
+ * the capabilities Ora declares in its own `initialize` are what decide whether the agent reports a
+ * model selector at all.
+ *
+ * Nothing here is specific to any one adapter: the caller supplies an already-spawned host-owned
+ * process and decides which conversation to hold on it.
+ */
+export class AcpProbe {
+  readonly #child: HostChildProcess;
+  readonly #pending = new Map<number, PendingCall>();
+  readonly #deadline: number;
+  #nextId = 1;
+  /** Set once the adapter can no longer answer, so later calls fail instead of waiting forever. */
+  #ended: Error | undefined;
+
+  private constructor(child: HostChildProcess, budgetMs: number) {
+    this.#child = child;
+    this.#deadline = Date.now() + budgetMs;
+  }
+
+  /**
+   * Starts reading one spawned process as an ACP peer.
+   *
+   * The process must already be running: resolving which executable to run is the caller's
+   * decision, and the failures that resolution raises — an adapter that is not installed, one that
+   * cannot run — are classifications Ora acts on, which would be flattened into an undifferentiated
+   * probe error here.
+   */
+  static attach(
+    child: HostChildProcess,
+    budgetMs: number = PROBE_BUDGET_MS,
+  ): AcpProbe {
+    const probe = new AcpProbe(child, budgetMs);
+    void probe.#pumpStdout();
+    void probe.#pumpStderr();
+    void child.exited.then(({ code, signal }) => {
+      probe.#end(
+        new AcpProbeError(
+          `the probe adapter exited (code ${code}, signal ${signal}) before answering`,
+        ),
+      );
+    });
+    return probe;
+  }
+
+  /** Sends one ACP request and resolves with its result, within the conversation's budget. */
+  async request(method: string, params: JsonValue): Promise<JsonValue> {
+    if (this.#ended !== undefined) {
+      throw this.#ended;
+    }
+    const id = this.#nextId++;
+    const answered = new Promise<JsonValue>((resolve, reject) => {
+      this.#pending.set(id, { resolve, reject });
+    });
+    try {
+      await this.#send({ jsonrpc: "2.0", id, method, params });
+    } catch (error) {
+      this.#pending.delete(id);
+      throw new AcpProbeError(`failed to send ${method}: ${describe(error)}`);
+    }
+    return await this.#withinBudget(answered, id, method);
+  }
+
+  /** Kills the probed process; idempotent, and safe on one that already exited. */
+  async close(): Promise<void> {
+    this.#end(new AcpProbeError("the probe was closed"));
+    try {
+      await this.#child.kill();
+    } catch {
+      // Best effort: the host treats kill as idempotent and the process may already be gone, and
+      // it reaps whatever survives when this plugin generation stops regardless.
+    }
+  }
+
+  /** Fails one pending call once the conversation's shared deadline passes. */
+  #withinBudget(
+    answered: Promise<JsonValue>,
+    id: number,
+    method: string,
+  ): Promise<JsonValue> {
+    const remaining = Math.max(0, this.#deadline - Date.now());
+    let timer: number | undefined;
+    const expiry = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        this.#pending.delete(id);
+        reject(
+          new AcpProbeError(
+            `${method} did not answer within the probe's ${
+              PROBE_BUDGET_MS / 1000
+            }s budget`,
+          ),
+        );
+      }, remaining);
+    });
+    return Promise.race([answered, expiry]).finally(() => clearTimeout(timer));
+  }
+
+  /** Routes one decoded frame to the call waiting for it. */
+  #dispatch(frame: JsonValue): void {
+    if (!isRecord(frame)) {
+      return;
+    }
+    if (typeof frame.method === "string") {
+      // The agent is asking the probe's client side for something. A probe advertises no client
+      // capabilities and has no user to prompt, so the only honest answer is a refusal — and it
+      // has to be sent, because an ACP request left unanswered stalls the handshake this probe is
+      // in the middle of rather than being quietly forgotten.
+      const id = frame.id;
+      if (typeof id === "number" || typeof id === "string") {
+        void this.#refuse(id, frame.method);
+      }
+      return;
+    }
+    const id = frame.id;
+    if (typeof id !== "number") {
+      return;
+    }
+    const call = this.#pending.get(id);
+    if (call === undefined) {
+      return;
+    }
+    this.#pending.delete(id);
+    if (isRecord(frame.error)) {
+      const message = typeof frame.error.message === "string"
+        ? frame.error.message
+        : JSON.stringify(frame.error);
+      call.reject(new AcpProbeError(message));
+      return;
+    }
+    call.resolve(frame.result ?? null);
+  }
+
+  /** Tells the agent this probe serves no client methods, without failing the conversation. */
+  async #refuse(id: number | string, method: string): Promise<void> {
+    try {
+      await this.#send({
+        jsonrpc: "2.0",
+        id,
+        error: {
+          code: METHOD_NOT_FOUND,
+          message: `${method} is not available during model discovery`,
+        },
+      });
+    } catch (error) {
+      console.debug(`probe could not refuse ${method}: ${describe(error)}`);
+    }
+  }
+
+  /** Writes one frame to the probed process as NDJSON. */
+  #send(frame: JsonValue): Promise<void> {
+    return this.#child.write(encodeLine(JSON.stringify(frame)));
+  }
+
+  /** Reads stdout until it closes, dispatching every ACP frame the process prints. */
+  async #pumpStdout(): Promise<void> {
+    try {
+      for await (const line of decodeLines(this.#child.stdout)) {
+        let frame: JsonValue;
+        try {
+          frame = JSON.parse(line) as JsonValue;
+        } catch {
+          console.debug(`probe dropped a non-JSON stdout line: ${line}`);
+          continue;
+        }
+        this.#dispatch(frame);
+      }
+      this.#end(new AcpProbeError("the probe adapter closed its ACP stream"));
+    } catch (error) {
+      this.#end(
+        new AcpProbeError(`probe stdout read failed: ${describe(error)}`),
+      );
+    }
+  }
+
+  /**
+   * Drains stderr so a chatty adapter cannot grow an unread buffer for the probe's lifetime, and
+   * keeps the diagnostics that explain a handshake which never completed.
+   */
+  async #pumpStderr(): Promise<void> {
+    try {
+      for await (const line of decodeLines(this.#child.stderr)) {
+        if (line.length > 0) {
+          console.debug(`[claude:probe] ${line}`);
+        }
+      }
+    } catch {
+      // The process is gone; whatever ended the stream is already reported through `#end`.
+    }
+  }
+
+  /** Ends the conversation, failing every call still waiting. The first cause is the one kept. */
+  #end(error: Error): void {
+    this.#ended ??= error;
+    const pending = [...this.#pending.values()];
+    this.#pending.clear();
+    for (const call of pending) {
+      call.reject(this.#ended);
+    }
+  }
+}
+
+function isRecord(value: JsonValue): value is { [key: string]: JsonValue } {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Renders any thrown value as a message safe to carry into a probe error. */
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

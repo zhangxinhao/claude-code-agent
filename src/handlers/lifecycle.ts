@@ -1,9 +1,6 @@
 import type { AgentStartContext } from "@ora-space/plugin-sdk";
-import { PluginMethodError } from "@ora-space/plugin-sdk";
+import { INVALID_PARAMS, PluginMethodError } from "@ora-space/plugin-sdk";
 import type { ClaudeClient } from "../services/claude-client.ts";
-
-/** The JSON-RPC code for a request the plugin refuses because its parameters are unusable. */
-const INVALID_PARAMS = -32602;
 
 /**
  * Serves `agent/start` by bringing the Claude ACP adapter up in the host's working directory.

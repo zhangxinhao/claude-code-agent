@@ -1,5 +1,5 @@
-import type { JsonValue } from "@ora-space/plugin-sdk";
-import { tryEachCandidate } from "./command.ts";
+import type { HostProcesses, JsonValue } from "@ora-space/plugin-sdk";
+import { spawnClaude } from "./command.ts";
 import { decodeLines, encodeLine } from "./ndjson.ts";
 
 /** The subset of a spawned child process this bridge depends on, so tests can substitute one. */
@@ -7,14 +7,19 @@ export interface SpawnedProcess {
   stdin: WritableStream<Uint8Array>;
   stdout: ReadableStream<Uint8Array>;
   stderr: ReadableStream<Uint8Array>;
-  readonly pid: number;
+  readonly pid: number | undefined;
   kill(): void;
   readonly exited: Promise<void>;
 }
 
 export interface ClaudeClientOptions {
-  /** Overrides process spawning; injected by tests. */
-  spawn?: (command: string, cwd: string) => SpawnedProcess;
+  /**
+   * Overrides process spawning; injected by tests. Production spawns through `attachProcesses`.
+   *
+   * Which program a spawn resolves to is `command.ts`'s decision and is deliberately not a
+   * parameter here: this class owns the adapter's lifetime, not the question of where it lives.
+   */
+  spawn?: (cwd: string) => SpawnedProcess;
   /** Receives every ACP frame emitted by the adapter, in output order. */
   onAcpFrame?: (frame: JsonValue) => void;
   /** Invoked after the adapter exits on its own, never after an explicit stop. */
@@ -31,26 +36,39 @@ interface RunningProcess {
  *
  * The adapter is a native ACP server: it takes no subcommand and no arguments, reads its initial
  * directory from the spawn cwd, and receives every per-session directory through ACP `session/new`.
- * The plugin owns its whole lifetime — spawn on `agent/start`, kill on `agent/stop` — so Ora never
- * sees the child's stdio, which is what lets Claude Code use ACP methods this host has never heard
- * of. Nothing here parses ACP; frames are re-framed between Ora's binary envelope and the adapter's
- * NDJSON and otherwise passed through verbatim.
+ * The plugin owns its whole lifetime — spawn on `agent/start`, kill on `agent/stop`, respawn on an
+ * Effect `reactivate` — so Ora never sees the child's stdio, which is what lets Claude Code use ACP
+ * methods this host has never heard of. Nothing here parses ACP; frames are re-framed between Ora's
+ * binary envelope and the adapter's NDJSON and otherwise passed through verbatim.
  */
 export class ClaudeClient {
-  readonly #spawn: (command: string, cwd: string) => SpawnedProcess;
+  readonly #spawn: (cwd: string) => SpawnedProcess | Promise<SpawnedProcess>;
   readonly #onAcpFrame: (frame: JsonValue) => void;
   readonly #onExited: () => void;
+  /** Supplied by `attachProcesses` once the plugin's `Plugin` instance exists; see `main.ts`. */
+  #processes: HostProcesses | undefined;
   #running: RunningProcess | undefined;
   #expectedExit = false;
 
   constructor(options: ClaudeClientOptions = {}) {
-    this.#spawn = options.spawn ?? spawnClaudeProcess;
+    this.#spawn = options.spawn ?? ((cwd) => this.#spawnViaHost(cwd));
     this.#onAcpFrame = options.onAcpFrame ?? (() => {});
     this.#onExited = options.onExited ?? (() => {});
   }
 
   get running(): boolean {
     return this.#running !== undefined;
+  }
+
+  /**
+   * Supplies the host-managed process client this plugin spawns `claude-agent-acp` through.
+   *
+   * Called once, from `onActivate`: the `Plugin` instance `createHostProcesses` needs does not
+   * exist yet when this client is constructed as a class field, so production spawning stays
+   * unavailable until this runs. Tests that inject `options.spawn` never need to call it.
+   */
+  attachProcesses(processes: HostProcesses): void {
+    this.#processes = processes;
   }
 
   /**
@@ -63,12 +81,11 @@ export class ClaudeClient {
     await this.stop();
     this.#expectedExit = false;
 
-    await tryEachCandidate((command) => {
-      const process = this.#spawn(command, cwd);
-      this.#running = { process, stdinWriter: process.stdin.getWriter() };
-      this.#attach(process);
-      return process;
-    });
+    // Failures are already classified for Ora by `spawnClaude`: an adapter this machine does not
+    // have stays retryable, while a pin naming a missing executable says so by name.
+    const process = await this.#spawn(cwd);
+    this.#running = { process, stdinWriter: process.stdin.getWriter() };
+    this.#attach(process);
   }
 
   /**
@@ -110,9 +127,14 @@ export class ClaudeClient {
     void this.#pumpStdout(process);
     void this.#pumpStderr(process);
     void process.exited.then(() => {
-      if (this.#running?.process === process) {
-        this.#running = undefined;
+      // A process that is no longer `#running` was already superseded by a later `start()` (an
+      // Effect restart, for instance); its death is old news, not a live agent going away, so it
+      // must never clear the new process's tracking or fire `onExited` regardless of the shared
+      // `#expectedExit` flag, which by then reflects the newer generation's intent, not this one's.
+      if (this.#running?.process !== process) {
+        return;
       }
+      this.#running = undefined;
       if (!this.#expectedExit) {
         console.warn("claude-agent-acp exited unexpectedly");
         this.#onExited();
@@ -162,27 +184,30 @@ export class ClaudeClient {
       console.warn(`claude-agent-acp stderr read failed: ${error}`);
     }
   }
-}
 
-/**
- * Spawns the adapter with all three stdio pipes exposed for streaming.
- *
- * No arguments are passed: `claude-agent-acp` is a native ACP server with no subcommand, and it
- * takes its initial directory from `cwd` rather than a flag.
- */
-function spawnClaudeProcess(command: string, cwd: string): SpawnedProcess {
-  const child = new Deno.Command(command, {
-    cwd,
-    stdin: "piped",
-    stdout: "piped",
-    stderr: "piped",
-  }).spawn();
-  return {
-    stdin: child.stdin,
-    stdout: child.stdout,
-    stderr: child.stderr,
-    pid: child.pid,
-    kill: () => child.kill(),
-    exited: child.status.then(() => undefined),
-  };
+  /**
+   * Asks the host to spawn and own the adapter process, adapting its `HostChildProcess` handle
+   * onto `SpawnedProcess` so every other method above stays unaware of who owns the OS process.
+   */
+  async #spawnViaHost(cwd: string): Promise<SpawnedProcess> {
+    if (this.#processes === undefined) {
+      throw new Error(
+        "ClaudeClient cannot spawn before attachProcesses() runs",
+      );
+    }
+    const child = await spawnClaude(this.#processes, { cwd });
+    return {
+      stdin: new WritableStream<Uint8Array>({
+        write: (chunk) => child.write(chunk),
+        close: () => child.closeStdin(),
+      }),
+      stdout: child.stdout,
+      stderr: child.stderr,
+      pid: child.pid,
+      // Best effort: the host already treats kill() as idempotent and tolerant of a process
+      // that is already gone, so a rejection here is nothing callers need to observe.
+      kill: () => void child.kill().catch(() => {}),
+      exited: child.exited.then(() => undefined),
+    };
+  }
 }

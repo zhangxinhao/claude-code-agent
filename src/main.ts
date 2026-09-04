@@ -2,9 +2,12 @@ import type {
   AcpSender,
   AgentModel,
   AgentStartContext,
+  HostProcesses,
   JsonValue,
 } from "@ora-space/plugin-sdk";
+import { AGENT_METHODS } from "@ora-space/plugin-sdk";
 import {
+  type AgentListModelsContext,
   AgentPlugin,
   type PluginContext,
   runAgentPlugin,
@@ -12,7 +15,11 @@ import {
 import { forwardAcpFrame } from "./handlers/acp.ts";
 import { SkillEffectCoordinator } from "./handlers/effects.ts";
 import { startClaude, stopClaude } from "./handlers/lifecycle.ts";
-import { listClaudeModels } from "./handlers/models.ts";
+import {
+  invalidateAllClaudeModels,
+  invalidateClaudeModels,
+  listClaudeModels,
+} from "./handlers/models.ts";
 import { ClaudeClient } from "./services/claude-client.ts";
 
 /** Must match `ora.id` in package.json, which is also this agent's identity inside Ora. */
@@ -28,7 +35,14 @@ const PLUGIN_ID = "ora-space.claude";
 class ClaudeAgentPlugin extends AgentPlugin {
   /** Valid only between `agent/start` and the end of the process; frames before that are lost. */
   #send: AcpSender | undefined;
-  /** The workspace root the adapter is running against; also what a Skill Effect restart respawns into. */
+  /** Set by `onActivate`, which the base class runs before the host can call anything. */
+  #processes: HostProcesses | undefined;
+  /**
+   * Workspace of the live ACP process.
+   *
+   * Used to invalidate its model catalog on lifecycle events, and as the directory a Skill Effect
+   * restart respawns the adapter into.
+   */
   #cwd: string | undefined;
 
   readonly #client = new ClaudeClient({
@@ -41,6 +55,9 @@ class ClaudeAgentPlugin extends AgentPlugin {
       });
     },
     onExited: () => {
+      if (this.#cwd !== undefined) {
+        invalidateClaudeModels(this.#cwd);
+      }
       console.warn(
         "the Claude ACP adapter exited on its own; Ora decides whether to reconnect",
       );
@@ -53,25 +70,48 @@ class ClaudeAgentPlugin extends AgentPlugin {
 
   override onActivate(context: PluginContext): void {
     console.info(`${context.pluginId} activated`);
+    this.#processes = context.processes;
+    this.#client.attachProcesses(context.processes);
   }
 
   override onStart = async (
     context: AgentStartContext,
     send: AcpSender,
   ): Promise<void> => {
+    if (this.#cwd !== undefined) {
+      invalidateClaudeModels(this.#cwd);
+    }
     this.#send = send;
     this.#cwd = context.cwd;
+    invalidateClaudeModels(context.cwd);
     await startClaude(this.#client, context);
   };
 
-  override onStop = (): Promise<void> => stopClaude(this.#client);
+  override onStop = async (): Promise<void> => {
+    if (this.#cwd !== undefined) {
+      invalidateClaudeModels(this.#cwd);
+    }
+    await stopClaude(this.#client);
+  };
 
-  override onListModels = (): AgentModel[] => listClaudeModels();
+  override onListModels = (
+    context: AgentListModelsContext,
+  ): Promise<AgentModel[]> => {
+    if (this.#processes === undefined) {
+      throw new Error(
+        `${AGENT_METHODS.listModels} was called before activation`,
+      );
+    }
+    // Discovery is answered for the Workspace the host named, not for `#cwd`: `agent/start` gets a
+    // neutral directory, and a user can open pickers for a project this connection never ran in.
+    return listClaudeModels(this.#processes, context.cwd);
+  };
 
   override onAcp = (frame: JsonValue): Promise<void> | void =>
     forwardAcpFrame(this.#client, this.#effects, frame);
 
   override async onDeactivate(): Promise<void> {
+    invalidateAllClaudeModels();
     await this.#client.stop();
   }
 }
