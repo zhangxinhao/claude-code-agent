@@ -18,6 +18,11 @@ import {
 import { listClaudeModels } from "../src/handlers/models.ts";
 import { BIN_ENV_VAR, resolveClaudeCommands } from "../src/services/command.ts";
 import {
+  bundledAdapterPath,
+  bundledClaudePath,
+} from "../src/services/bundled-binary.ts";
+import { releaseManifest } from "../scripts/package.ts";
+import {
   ClaudeClient,
   type SpawnedProcess,
 } from "../src/services/claude-client.ts";
@@ -41,6 +46,103 @@ Deno.test("every Windows spelling an installer writes is named", () => {
         "claude-agent-acp",
       ]
       : ["claude-agent-acp"],
+  );
+});
+
+Deno.test("the release manifest is what a marketplace entry is pasted from", () => {
+  const rendered = releaseManifest(
+    [
+      "resolver = 1",
+      'identifier = "ora-space.claude"',
+      'version = "0.3.0"',
+      "",
+    ].join("\n"),
+    [
+      {
+        triple: "x86_64-pc-windows-msvc",
+        url: "https://example.invalid/a.orax",
+        sha256: "aa",
+      },
+      {
+        triple: "aarch64-apple-darwin",
+        url: "https://example.invalid/b.orax",
+        sha256: "bb",
+      },
+    ],
+  );
+  assertEquals(
+    rendered,
+    `resolver = 1
+identifier = "ora-space.claude"
+version = "0.3.0"
+
+[[targets]]
+target = "x86_64-pc-windows-msvc"
+url = "https://example.invalid/a.orax"
+sha256 = "aa"
+
+[[targets]]
+target = "aarch64-apple-darwin"
+url = "https://example.invalid/b.orax"
+sha256 = "bb"
+`,
+  );
+  // The host rejects a manifest carrying both release forms, and it reads the top-level keys as
+  // the plugin's own only while they precede every table header.
+  assertEquals(
+    /^url =|^sha256 =/m.test(rendered.split("[[targets]]")[0]),
+    false,
+  );
+  assertEquals(rendered.includes("[artifact]"), false);
+});
+
+Deno.test("both bundled binaries land where each consumer looks for them", () => {
+  // These four strings are a contract between three files that never call each other: the plugin
+  // asks the host to spawn the adapter at one, the compiled adapter looks beside itself for the
+  // CLI at the other, and packaging stages both. Asserting the literals is the point — a change
+  // that "just renames a path" has to be made in every one of them or the package cannot start.
+  assertEquals(
+    bundledAdapterPath("windows"),
+    "assets/bin/claude-agent-acp.exe",
+  );
+  assertEquals(bundledAdapterPath("linux"), "assets/bin/claude-agent-acp");
+  assertEquals(bundledClaudePath("windows"), "assets/bin/claude.exe");
+  assertEquals(bundledClaudePath("darwin"), "assets/bin/claude");
+});
+
+Deno.test("the bundled adapter is asked for before anything on PATH", async () => {
+  const spawns: HostChildProcessOptions[] = [];
+  await listClaudeModels(
+    fakeProcesses(defaultAcpAgent, spawns),
+    uniqueWorkspace(),
+  );
+  // Ora only reaches into a package for a binary the plugin names, so omitting this is the whole
+  // difference between a package that runs what it ships and one that silently runs the user's
+  // own install — which is invisible until the two versions disagree.
+  assertEquals(
+    spawns.map((options) => options.packageCommand),
+    [bundledAdapterPath()],
+  );
+  // The ladder is sequential, not a list handed over at once: this spawn names no PATH command
+  // at all, and PATH is consulted only after the host reports the package carries no such file.
+  assertEquals(Object.hasOwn(spawns[0], "command"), false);
+});
+
+Deno.test("the compiled adapter pins its CLI with this package's own variable", async () => {
+  const entry = await Deno.readTextFile(
+    new URL("../scripts/adapter-entry.mjs", import.meta.url),
+  );
+  assertEquals(entry.includes('"ORA_CLAUDE_BIN"'), true);
+  // Read as text because this file is compiled by Bun into a separate process and never imported
+  // here. `CLAUDE_CODE_EXECUTABLE` may only ever be written, never read: honouring an inherited
+  // one would run a different CLI than the package ships, and nothing would say so.
+  assertEquals(
+    entry.includes("process.env.CLAUDE_CODE_EXECUTABLE ="),
+    true,
+  );
+  assertEquals(
+    /process\.env\.CLAUDE_CODE_EXECUTABLE(?!\s*=)/.test(entry),
+    false,
   );
 });
 

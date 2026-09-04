@@ -91,6 +91,125 @@ user-level `~/.claude/skills` directory, and declaring that would be a mistake:
 Ora fully owns what it materializes into a declared Resource, so it would
 reconcile away Skills another tool put there.
 
+## What a package ships, and the two binaries in it
+
+A release carries **one `.orax` per target triple**, and each one bundles both
+halves of the agent:
+
+```
+assets/bin/claude-agent-acp[.exe]   the ACP adapter, compiled to a single file by Bun
+assets/bin/claude[.exe]             the native Claude Code CLI the adapter drives
+main.js                             this plugin
+orax.toml                           with [artifact] target = "<triple>"
+```
+
+The CLI is bundled rather than resolved from the user's machine because
+**`claude-agent-acp` and the CLI are a pair upstream publishes together**: the
+adapter pins an exact `@anthropic-ai/claude-agent-sdk` version, and that SDK
+ships a `manifest.json` naming the exact CLI build it was published against, per
+platform, with a SHA-256. The bridge between the two is an Anthropic-internal
+interface, so an unpaired combination fails in ways that only reproduce on the
+machine that has it. Bundling both is what makes a package's behaviour a
+property of the package rather than of the machine — and it is also what gives
+Ora a download to show progress for.
+
+`src/services/bundled-binary.ts` is the only place those paths are written down.
+Three things have to agree on them — `command.ts` (what the host is asked to
+spawn), `scripts/adapter-entry.mjs` (where the adapter looks for its CLI), and
+`scripts/package.ts` (where both are staged) — and a disagreement surfaces only
+as an install that cannot start.
+
+### Why the adapter needs a generated entry point at all
+
+The published adapter is a Node program that finds its CLI with
+`createRequire(...).resolve("@anthropic-ai/claude-agent-sdk-<platform>/claude")`
+— a `node_modules` lookup that cannot work inside a compiled single-file binary.
+`scripts/adapter-entry.mjs` answers that question before handing control to the
+adapter unchanged, by setting `CLAUDE_CODE_EXECUTABLE` from its own ladder:
+
+1. **`ORA_CLAUDE_BIN`** — pins one exact CLI, and fails if it points at nothing.
+2. **the bundled CLI beside it**, found through `process.execPath`, which is the
+   only way to locate the installed package from inside a process the host
+   spawned.
+3. **a local install** — every Windows spelling, then `~/.local/bin`, with a
+   warning to stderr, because at that point the pair is no longer the tested
+   one.
+
+`CLAUDE_CODE_EXECUTABLE` from the surrounding environment is deliberately
+**not** honoured: it is upstream's variable, not this package's, and a stray one
+would silently run a different CLI than the package ships. `ORA_CLAUDE_BIN` is
+the knob.
+
+Step 3 is not just insurance. Packages are built per triple, so on Windows and
+macOS a bundled binary that exists also runs — but libc is not part of a triple,
+and the `-gnu` build this package ships cannot exec on a musl system at all.
+That case is detected up front (`/lib/ld-musl-*`) so it becomes a fallback
+rather than a crash that says nothing about libc.
+
+Everything that entry point writes goes to **stderr**: it runs as the adapter's
+own process, so its stdout is the ACP channel — the same rule as the plugin's,
+one process further down.
+
+## The release pipeline
+
+Two commands, deliberately separate:
+
+```
+deno task sync      # resolve upstream, write upstream.lock.json
+deno task package   # reproduce exactly what the lock records
+```
+
+`upstream.lock.json` records the whole chain — adapter version, SDK version,
+Claude Code version, and per-platform tarball integrity plus the CLI's own size
+and SHA-256. **Packaging resolves nothing by name**, so rebuilding a tag
+produces the same bytes and a version bump arrives as a reviewable diff rather
+than as whatever npm answered that day. `deno task sync --check` exits `20` when
+the lock is behind, which is what a scheduled job branches on.
+
+Two independent digests are verified per target, and they prove different
+things: the tarball against npm's `dist.integrity` (this is the package that was
+published) and the extracted CLI against the SDK manifest's checksum (this is
+the build the adapter was published against).
+
+`--target <triple>` builds one package, which is what to use locally — a full
+run downloads a few hundred megabytes per platform.
+
+### Versioning, and the two ways a release starts
+
+**This plugin's version is its own.** It deliberately does not mirror the
+adapter's, which moves for reasons that have nothing to do with this package —
+what a user has installed should say which version of _this_ plugin they are
+running, and `upstream.lock.json` in that release says which upstream pair it
+carries.
+
+Two paths produce a release, and both end in the same `release.yml`:
+
+| Trigger                               | Version                         | Who bumps it                                |
+| ------------------------------------- | ------------------------------- | ------------------------------------------- |
+| a new `claude-agent-acp` (daily cron) | patch `z` + 1                   | `upstream.yml` commits the bump and the tag |
+| a change to the plugin itself         | whatever the maintainer chooses | the maintainer, in the commit they tag      |
+
+`release.yml` **fails if the tag and `orax.toml` `version` disagree**, because
+Ora installs a package under the version inside it rather than the one in the
+release title — so a mismatch publishes an artifact that installs as something
+else. Bump `orax.toml` _and_ `deno.json`, then tag that commit.
+
+`upstream.yml` calls `release.yml` through `workflow_call` rather than pushing a
+tag and letting the tag trigger it. That is not a style choice: **a tag pushed
+with the built-in `GITHUB_TOKEN` does not start another workflow run**, so the
+tag-and-hope design would tag every upstream bump and publish none of them.
+
+### One packaging trap worth knowing
+
+zip.js reads a custom `Reader` by pulling fixed-size chunks with **no idea of
+the total**: the only thing that ends the stream is a read that returns an empty
+array. A `readUint8Array` that returns the full requested length — a zero-padded
+buffer past end of file — never terminates, and quietly writes zeroes into the
+archive until the disk fills. It looks like a slow build, not a failure. Hence
+`FileReader.readUint8Array` returns `buffer.subarray(0, read)`, and `writeOrax`
+asserts the finished package is not meaningfully larger than the bytes staged
+for it.
+
 ## Resolving the adapter on Windows — always include `.bat`
 
 **Every list of PATH spellings for the adapter must name `.exe`, `.cmd`, `.bat`,
@@ -135,7 +254,17 @@ than being buried under the next attempt.
 
 `ORA_CLAUDE_ACP_BIN` outranks the whole ladder and is used alone, never with a
 fallback: silently running a different adapter than the one a developer named is
-worse than failing.
+worse than failing. It pins the **adapter** only — the CLI the adapter then
+drives is pinned separately with `ORA_CLAUDE_BIN`, which is read one process
+further down, in `scripts/adapter-entry.mjs`.
+
+Since packages bundle an adapter, this PATH ladder is reached only when the host
+reports the package carries none. `spawnAgentProcess` is given both
+(`packageCommand` and `command`) and advances **only** on
+`package_command_missing`: a bundled adapter that is present but cannot run is a
+property of the package, not of this machine, so it raises `AGENT_UNUSABLE`
+rather than quietly running some other adapter. Do not relabel that as
+`AGENT_NOT_INSTALLED` — it would be retried forever.
 
 ## Process ownership
 
@@ -212,7 +341,9 @@ Ora parses and validates that table today but does not yet enforce it.
 
 ## Working on this repository
 
-- `deno task check` / `lint` / `format` / `test` / `simulate` / `build`.
+- `deno task check` / `lint` / `format` / `test` / `simulate` / `build`, plus
+  `sync` and `package` for releases. Packaging needs `bun` on PATH (it compiles
+  the adapter) and network access to the npm registry; nothing else.
 - The SDK is imported from its published JSR package and pinned in `deno.json`;
   keep `deno.lock` synchronized when changing the SDK version — see the root
   `../AGENTS.md` before bumping it, since the Effect API and process-ownership
@@ -227,4 +358,6 @@ Ora parses and validates that table today but does not yet enforce it.
   the kind whose absence is invisible at runtime.
 - Bump `orax.toml` `version` before handing someone a `.orax` to import.
   `install_local` refuses a version that is already installed and never retires
-  older ones, so reusing a number silently leaves the old code running.
+  older ones, so reusing a number silently leaves the old code running. Keep
+  `deno.json` in step with it — `release.yml` checks `orax.toml` against the
+  tag, but nothing checks the two files against each other.

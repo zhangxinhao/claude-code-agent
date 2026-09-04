@@ -1,1 +1,15 @@
+# Build output: the bundled entrypoint, the compiled adapter, the staging tree, downloaded upstream
+# archives, and the .orax packages themselves. All reproducible from upstream.lock.json with
+# `deno task build && deno task package`.
 dist/
+
+# Nothing here is an npm package -- orax.toml is the manifest and Deno is the runtime -- but the
+# packaging script installs the adapter's dependencies under dist/, and a stray `npm install` in
+# this directory would leave these behind.
+node_modules/
+package-lock.json
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.swp

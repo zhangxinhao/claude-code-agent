@@ -1,10 +1,23 @@
 name: Release
 
+# Builds and publishes one .orax per target for a single tag.
+#
+# Two things reach this workflow, and they are deliberately the same path: a maintainer pushing a
+# tag for a change to the plugin itself, and `upstream.yml` calling it after a new
+# `claude-agent-acp` appeared. Everything about what gets bundled lives in `upstream.lock.json`
+# and `bundle.config.ts`, so this file states only how a release is made, never what is in it.
+
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      tag:
+        description: The tag to build and publish, which must already exist.
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,31 +25,84 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
+      # `inputs.tag` is empty for a pushed tag, and `github.ref` is that tag's ref, so one
+      # expression serves both entry points.
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
 
+      # Packaging compiles the adapter into a single-file binary for every target, which is Bun's
+      # job; the cross-compilation runtimes are downloaded on demand.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Ora installs a package under the version inside it, not the one in the release title, so a
+      # tag disagreeing with the manifest would publish an artifact that installs as something
+      # else. Failing here is the last point at which that is still cheap to fix.
+      - name: Check the tag matches the manifest
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version *=' orax.toml | sed -E 's/^version *= *"(.*)"/\1/')
+          if [ "$TAG" != "v${VERSION}" ]; then
+            echo "::error::tag ${TAG} does not match orax.toml version ${VERSION}"
+            echo "::error::bump orax.toml and deno.json to ${TAG#v}, then tag that commit"
+            exit 1
+          fi
+          echo "releasing ${TAG} (orax.toml version ${VERSION})"
+
       - name: Build
         run: deno task build
 
-      - name: Package .orax archive
-        run: |
-          set -euo pipefail
-          NAME=$(grep -m1 '^identifier *=' orax.toml | sed -E 's/^identifier *= *"(.*)"/\1/')
-          FILE="${NAME}-${GITHUB_REF_NAME}.orax"
-          zip -j "$FILE" orax.toml dist/main.js logo.svg README.md
-          echo "ORAX_FILE=$FILE" >> "$GITHUB_ENV"
+      # Writes dist/packages/*.orax (one per target in bundle.config.ts) and dist/manifest.toml,
+      # reproducing exactly what upstream.lock.json records and verifying every download against it.
+      - name: Package
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: deno task package --tag "$TAG" --repo "${{ github.repository }}"
 
-      - name: Create Release
-        if: github.ref_type == 'tag'
+      - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" "${ORAX_FILE}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+          set -euo pipefail
+          ADAPTER=$(jq -r '.adapter.version' upstream.lock.json)
+          CLAUDE=$(jq -r '.agentSdk.claudeVersion' upstream.lock.json)
+          {
+            printf 'Bundles `claude-agent-acp` %s with Claude Code %s.\n\n' "$ADAPTER" "$CLAUDE"
+            printf 'Each `.orax` carries both binaries and installs only on the target it was '
+            printf 'built for. `manifest.toml` is the release form the marketplace index reads.\n'
+          } > notes.md
+          gh release create "$TAG" dist/packages/*.orax dist/manifest.toml \
+            --title "$TAG" --notes-file notes.md --generate-notes
+
+      # `dist/manifest.toml` is copied verbatim into the marketplace registry, so it is put in the
+      # run summary as well as attached to the release: a maintainer publishing an entry is already
+      # on this page, and would otherwise have to download a release asset to read four lines.
+      - name: Show the marketplace entry
+        run: |
+          set -euo pipefail
+          ID=$(grep -m1 '^identifier *=' orax.toml | sed -E 's/^identifier *= *"(.*)"/\1/')
+          {
+            echo "## Marketplace entry"
+            echo
+            echo "Copy into \`registry/${ID:0:1}/${ID}/orax.toml\`:"
+            echo
+            echo '```toml'
+            cat dist/manifest.toml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

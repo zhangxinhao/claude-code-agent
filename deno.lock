@@ -3,7 +3,15 @@
   "specifiers": {
     "jsr:@ora-space/plugin-sdk@0.9.0": "0.9.0",
     "jsr:@std/assert@1": "1.0.19",
-    "jsr:@std/internal@^1.0.12": "1.0.14"
+    "jsr:@std/cli@^1.0.32": "1.0.32",
+    "jsr:@std/crypto@^1.0.5": "1.1.0",
+    "jsr:@std/encoding@^1.0.10": "1.0.11",
+    "jsr:@std/internal@^1.0.12": "1.0.14",
+    "jsr:@std/internal@^1.0.14": "1.0.14",
+    "jsr:@std/path@^1.1.6": "1.1.6",
+    "jsr:@std/streams@^1.0.17": "1.1.2",
+    "jsr:@std/tar@~0.1.10": "0.1.10",
+    "jsr:@zip-js/zip-js@^2.8.61": "2.9.0"
   },
   "jsr": {
     "@ora-space/plugin-sdk@0.9.0": {
@@ -12,17 +20,50 @@
     "@std/assert@1.0.19": {
       "integrity": "eaada96ee120cb980bc47e040f82814d786fe8162ecc53c91d8df60b8755991e",
       "dependencies": [
-        "jsr:@std/internal"
+        "jsr:@std/internal@^1.0.12"
       ]
+    },
+    "@std/cli@1.0.32": {
+      "integrity": "188b3a100d6202d64e3f5bd3d799c7fa4f6d77f92cc65eb7f641c1fa0aa92a66"
+    },
+    "@std/crypto@1.1.0": {
+      "integrity": "b8d6d0a6377a32b213af2661ed7bf1062d94feac0c57def5526a8e74a95c3ec8"
+    },
+    "@std/encoding@1.0.11": {
+      "integrity": "e7cef2f0b3153bccc17431e7c864a1de03a4b6d9647389c43e08aaa775d37385"
     },
     "@std/internal@1.0.14": {
       "integrity": "291516b3d4c35024d6ffbc0a9df5bf4c64116e05b50012cf846710152d2ffdf7"
+    },
+    "@std/path@1.1.6": {
+      "integrity": "c68485c2a4dfbb5ae3cc74fae4e8c4e5d874cf8a8ed12927917235c758b46cbe",
+      "dependencies": [
+        "jsr:@std/internal@^1.0.14"
+      ]
+    },
+    "@std/streams@1.1.2": {
+      "integrity": "0249bf9b78a999f57032ca4d8e7ccaa57579090242640b35ddc948fbb745d3af"
+    },
+    "@std/tar@0.1.10": {
+      "integrity": "6bf907f3a4bc8bfef42973ba132d946756a6161ef6b914a9e1c06debe664db17",
+      "dependencies": [
+        "jsr:@std/streams"
+      ]
+    },
+    "@zip-js/zip-js@2.9.0": {
+      "integrity": "67e3f997e7791c1822a4a57c1af7b2faa65334f01f22184d188768003414036c"
     }
   },
   "workspace": {
     "dependencies": [
       "jsr:@ora-space/plugin-sdk@0.9.0",
-      "jsr:@std/assert@1"
+      "jsr:@std/assert@1",
+      "jsr:@std/cli@^1.0.32",
+      "jsr:@std/crypto@^1.0.5",
+      "jsr:@std/encoding@^1.0.10",
+      "jsr:@std/path@^1.1.6",
+      "jsr:@std/tar@~0.1.10",
+      "jsr:@zip-js/zip-js@^2.8.61"
     ]
   }
 }

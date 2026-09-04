@@ -1,0 +1,113 @@
+name: Upstream
+
+# Watches `claude-agent-acp` and releases a new patch version of this plugin whenever upstream
+# publishes one.
+#
+# The release itself is not duplicated here: this workflow calls `release.yml`, which is also what
+# a maintainer's own tag runs. That is not only to avoid repeating the steps — a tag pushed with
+# the built-in `GITHUB_TOKEN` deliberately does not start another workflow run, so a design where
+# this job only pushed a tag and expected `release.yml` to notice would tag every upstream bump
+# and never publish any of them.
+
+on:
+  schedule:
+    # 02:00 Beijing time, which is 18:00 UTC the day before — GitHub schedules in UTC only. Late
+    # enough that a bad release is found by a maintainer in the morning rather than by a user.
+    - cron: "0 18 * * *"
+  # Gives the workflow a "Run workflow" button in the Actions tab, for checking upstream without
+  # waiting for the nightly run.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+# One at a time: two overlapping runs would both see the same upstream version, and the second
+# would try to tag a version the first had already published.
+concurrency:
+  group: upstream-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      behind: ${{ steps.check.outputs.behind }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # `sync --check` resolves upstream and compares it against the whole lock, not just the
+      # adapter's version number: upstream can republish an adapter against a different SDK patch,
+      # and a release that bundled a different CLI under an unchanged version would be the hardest
+      # kind of difference to notice later. Exit 20 is "behind"; anything else non-zero is a real
+      # failure and must not be read as "nothing to do".
+      - name: Check for a new adapter release
+        id: check
+        run: |
+          set -euo pipefail
+          code=0
+          deno task sync --check || code=$?
+          case "$code" in
+            0) echo "behind=false" >> "$GITHUB_OUTPUT" ;;
+            20) echo "behind=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::sync --check failed with $code"; exit "$code" ;;
+          esac
+
+      - name: Pin the new upstream and bump the patch version
+        id: bump
+        if: steps.check.outputs.behind == 'true'
+        run: |
+          set -euo pipefail
+          deno task sync
+
+          # This plugin's version is its own: the patch position counts releases of this package,
+          # and an upstream bump is one of the things that causes one. It deliberately does not
+          # mirror the adapter's version, which moves for reasons that have nothing to do with
+          # this plugin.
+          CURRENT=$(grep -m1 '^version *=' orax.toml | sed -E 's/^version *= *"(.*)"/\1/')
+          MAJOR=${CURRENT%%.*}
+          REST=${CURRENT#*.}
+          MINOR=${REST%%.*}
+          PATCH=${REST#*.}
+          NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          TAG="v${NEXT}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::${TAG} already exists; the version was bumped without a release"
+            exit 1
+          fi
+
+          sed -i -E "s/^version = \"${CURRENT}\"/version = \"${NEXT}\"/" orax.toml
+          sed -i -E "s/\"version\": \"${CURRENT}\"/\"version\": \"${NEXT}\"/" deno.json
+
+          ADAPTER=$(jq -r '.adapter.version' upstream.lock.json)
+          CLAUDE=$(jq -r '.agentSdk.claudeVersion' upstream.lock.json)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "bumping ${CURRENT} -> ${NEXT} for claude-agent-acp ${ADAPTER} (Claude Code ${CLAUDE})"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add orax.toml deno.json upstream.lock.json
+          git commit -m "Bundle claude-agent-acp ${ADAPTER} (Claude Code ${CLAUDE})"
+          # The tag is pushed before the release runs so `release.yml` has something to check out,
+          # and both are pushed together so a failure cannot leave a tag with no commit behind it.
+          git tag "${TAG}"
+          git push origin HEAD "${TAG}"
+
+  release:
+    needs: check
+    if: needs.check.outputs.behind == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.check.outputs.tag }}
+    permissions:
+      contents: write

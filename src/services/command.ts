@@ -7,6 +7,7 @@ import {
   PluginMethodError,
   spawnAgentProcess,
 } from "@ora-space/plugin-sdk";
+import { bundledAdapterPath } from "./bundled-binary.ts";
 
 /** The npm bin name of the ACP adapter that fronts Claude Code. */
 const BINARY_NAME = "claude-agent-acp";
@@ -38,7 +39,7 @@ export function resolveClaudeCommands(): string[] {
 }
 
 /**
- * Spawns Claude Code's ACP adapter through the host, whichever spelling this machine answers to.
+ * Spawns Claude Code's ACP adapter through the host, preferring the one this package ships.
  *
  * The host owns the OS process rather than this sandboxed runtime: it terminates process trees
  * and reclaims every child this plugin generation left behind, which a plugin spawning its own
@@ -46,11 +47,17 @@ export function resolveClaudeCommands(): string[] {
  * handle a plugin holds is the shim and the real adapter underneath it can outlive a kill of the
  * wrapper.
  *
- * No `packageCommand` is named because this package ships no adapter of its own — `claude-agent-acp`
- * is always the user's own npm install.
+ * Both ways of reaching an adapter are named, because this source cannot know at build time which
+ * package it ended up in. `spawnAgentProcess` answers that at spawn time: it asks for the bundled
+ * adapter first and falls through to a PATH lookup only when the host reports that this package
+ * carries no such file, which is how a package built without a bundled adapter announces itself.
+ * A bundled adapter that is present but cannot run is a property of the package rather than of
+ * this machine, so it fails the agent outright instead of quietly running some other adapter.
  *
- * `ORA_CLAUDE_ACP_BIN` outranks the PATH lookup, and is returned alone: a pin that quietly fell
- * back to whatever is on PATH would run a different adapter than the user asked for.
+ * `ORA_CLAUDE_ACP_BIN` outranks both, and is used alone: a pin that quietly fell back to whatever
+ * is on PATH would run a different adapter than the user asked for. It pins the adapter only —
+ * the Claude Code CLI the adapter then drives is pinned separately, with `ORA_CLAUDE_BIN`, which
+ * is read inside the adapter process rather than here.
  */
 export function spawnClaude(
   processes: HostProcesses,
@@ -64,8 +71,14 @@ export function spawnClaude(
 }
 
 /**
- * Resolves the adapter off PATH, replacing the SDK's generic "not found" message with one that
- * names the npm package a user can install and the env var that bypasses PATH entirely.
+ * Runs the bundled adapter, or resolves one off PATH, replacing the SDK's generic "not found"
+ * message with one that names the npm package a user can install and the env var that bypasses
+ * PATH entirely.
+ *
+ * The replacement only ever applies to the PATH half of the ladder: a package that ships an
+ * adapter never reaches it, and a bundled adapter that fails raises `AGENT_UNUSABLE` from inside
+ * `spawnAgentProcess`, which is a different code and must not be relabelled as "not installed"
+ * and retried forever.
  */
 async function spawnResolved(
   processes: HostProcesses,
@@ -75,7 +88,7 @@ async function spawnResolved(
   try {
     return await spawnAgentProcess(
       processes,
-      { command: candidates },
+      { packageCommand: bundledAdapterPath(), command: candidates },
       invocation,
     );
   } catch (error) {

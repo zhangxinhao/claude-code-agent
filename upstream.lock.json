@@ -1,0 +1,44 @@
+{
+  "adapter": {
+    "name": "@agentclientprotocol/claude-agent-acp",
+    "version": "0.73.0",
+    "integrity": "sha512-xKnGIntdBbr2dDS2NEsVGdjoLH62EaWjfYlp/U7TYdxUJzERlApe2gliYW3rVFTeWGjG0dUyPszhG9TWhsqGlA==",
+    "tarball": "https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/-/claude-agent-acp-0.73.0.tgz"
+  },
+  "agentSdk": {
+    "name": "@anthropic-ai/claude-agent-sdk",
+    "version": "0.3.257",
+    "integrity": "sha512-Se55zXv48IYLg/WzoXzpbPLcq86suwDSbRUoNb69l4dkovorqS/47Xuy7MUo/gPNwwcPB4a+aqbXbshU33dcdQ==",
+    "tarball": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/-/claude-agent-sdk-0.3.257.tgz",
+    "claudeVersion": "2.1.257"
+  },
+  "platforms": {
+    "win32-x64": {
+      "name": "@anthropic-ai/claude-agent-sdk-win32-x64",
+      "version": "0.3.257",
+      "integrity": "sha512-NW0zMjHXFBdu2TcjT9Zo5o/1tJaDy6A7v4Gt/vLVJgaipV/RzAbyRGXZzH37hswyiKrSLGaSoYYP1vUfncbkUQ==",
+      "tarball": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-win32-x64/-/claude-agent-sdk-win32-x64-0.3.257.tgz",
+      "binary": "claude.exe",
+      "size": 218504864,
+      "sha256": "190a5fe1a2a0c76176cd4e387a2c3555220ca7acadda295d2d45cdbc562bd400"
+    },
+    "darwin-arm64": {
+      "name": "@anthropic-ai/claude-agent-sdk-darwin-arm64",
+      "version": "0.3.257",
+      "integrity": "sha512-ITjFPYB8riu9tbxbrWArokiZ/90w/NDrYbtEvyr3ScilVtu1iupkComxkhvbUxoyT4JRDpKsdw/ZOfwSl/pkpA==",
+      "tarball": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-darwin-arm64/-/claude-agent-sdk-darwin-arm64-0.3.257.tgz",
+      "binary": "claude",
+      "size": 199011264,
+      "sha256": "64590d7d9d9c189d33fb3dfa58c5408eaf2a10fe556bd84155d95efaab46b60e"
+    },
+    "linux-x64": {
+      "name": "@anthropic-ai/claude-agent-sdk-linux-x64",
+      "version": "0.3.257",
+      "integrity": "sha512-0FRyIwV4jEJErdDDoYMC0v9lzuFNz5y0lK2340H5fP02eNXsP3U0htKW/bfRP8Ppei+xc4QUZgdCI6rVzkhXGg==",
+      "tarball": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-linux-x64/-/claude-agent-sdk-linux-x64-0.3.257.tgz",
+      "binary": "claude",
+      "size": 215469464,
+      "sha256": "9a64bda9d8722a1fa05bef9a5961d07e0331b99597eda9e2f6a732f3a0ff7f05"
+    }
+  }
+}
