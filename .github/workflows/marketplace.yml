@@ -1,0 +1,212 @@
+name: Marketplace
+
+# Opens — or refreshes — the pull request that publishes this plugin's latest release into
+# `ora-space/marketplace`.
+#
+# Releasing and publishing are deliberately two steps. `release.yml` builds the packages and
+# attaches `manifest.toml`, but nothing installs from a release until the registry entry points at
+# it, so a release that turns out to be bad can be superseded before anyone picks it up. This
+# workflow closes that gap on a schedule rather than at release time, which also means an entry
+# that drifted behind for any other reason — a PR nobody merged, a manual edit — is caught on the
+# next night instead of staying stale until someone notices.
+#
+# Nothing here merges anything: a human still reviews and merges the PR in the marketplace repo.
+
+on:
+  schedule:
+    # 03:00 Beijing time, which is 19:00 UTC the day before — GitHub schedules in UTC only. One
+    # hour after `upstream.yml`, so a nightly upstream bump and the release it triggers are already
+    # published by the time this looks for the latest tag.
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag to publish. Defaults to this repository's latest release.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One at a time: two overlapping runs would both force-push the same branch and race on the PR.
+concurrency:
+  group: marketplace-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # `APP_ID` and `APP_PRIVATE_KEY` are organization-level and shared with selected repositories
+      # only, so this repository can be off that list — which is expected configuration waiting on
+      # an owner, not a broken workflow. Reaching `create-github-app-token` without them fails with
+      # an opaque token error every single night, so the gap is named here instead and the
+      # publishing steps are skipped until it closes. `secrets` cannot be read from a step `if:`,
+      # hence the bounce through an output.
+      - name: Check for the marketplace credentials
+        id: credentials
+        env:
+          APP_ID: ${{ vars.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          MISSING=
+          [ -n "${APP_ID:-}" ] || MISSING="${MISSING} vars.APP_ID"
+          [ -n "${APP_PRIVATE_KEY:-}" ] || MISSING="${MISSING} secrets.APP_PRIVATE_KEY"
+          if [ -z "$MISSING" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::nothing will be published:${MISSING} is not available here"
+          {
+            echo "## Not published"
+            echo
+            echo "\`${MISSING# }\` is not available to \`${GITHUB_REPOSITORY}\`."
+            echo
+            echo "Ask an \`ora-space\` owner to add this repository to the visibility list of the"
+            echo "organization's \`APP_ID\` variable and \`APP_PRIVATE_KEY\` secret. Everything"
+            echo "below ran; only the marketplace pull request was skipped."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Everything downstream is derived from `orax.toml` rather than written out here, so this
+      # file stays correct if the plugin is ever renamed or re-identified.
+      - name: Resolve the release to publish
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${REQUESTED_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          fi
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::not a release tag: ${TAG}"
+            exit 1
+          fi
+          ID=$(grep -m1 '^identifier *=' orax.toml | sed -E 's/^identifier *= *"(.*)"/\1/')
+          TITLE=$(grep -m1 '^title *=' orax.toml | sed -E 's/^title *= *"(.*)"/\1/')
+          {
+            echo "tag=${TAG}"
+            echo "version=${TAG#v}"
+            echo "id=${ID}"
+            echo "title=${TITLE}"
+            echo "dir=registry/${ID:0:1}/${ID}"
+          } >> "$GITHUB_OUTPUT"
+          echo "publishing ${TITLE} ${TAG} as ${ID}"
+
+      # The registry entry is the release's own `manifest.toml`, copied verbatim: it already
+      # records the download URLs and SHA-256 of the exact artifacts that were published, so
+      # regenerating it here could only ever disagree with what users would install.
+      - name: Download the release manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern manifest.toml \
+            --dir dist \
+            --clobber
+          MANIFEST_VERSION=$(grep -m1 '^version *=' dist/manifest.toml | sed -E 's/^version *= *"(.*)"/\1/')
+          if [ "$MANIFEST_VERSION" != "$VERSION" ]; then
+            echo "::error::${TAG} ships a manifest for ${MANIFEST_VERSION}"
+            exit 1
+          fi
+
+      # `GITHUB_TOKEN` is scoped to this repository and cannot write to the marketplace, so the
+      # cross-repository push borrows a short-lived installation token instead of a long-lived PAT.
+      # `APP_ID` and `APP_PRIVATE_KEY` are the same organization-level pair the other ora-space
+      # publishing workflows use.
+      - name: Create a marketplace token
+        id: app-token
+        if: steps.credentials.outputs.ready == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ora-space
+          repositories: marketplace
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Clone the marketplace
+        if: steps.credentials.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/ora-space/marketplace.git" marketplace
+
+      # The branch is named per plugin rather than per tag, and the push is a force-push onto a
+      # branch cut from the marketplace's default branch. Branching per tag would leave one open PR
+      # per release as soon as two nights in a row produced one, and those PRs would all conflict
+      # on the same file; with one branch, an unmerged PR is retargeted at the newer release.
+      - name: Open or refresh the marketplace pull request
+        if: steps.credentials.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          ID: ${{ steps.release.outputs.id }}
+          TITLE: ${{ steps.release.outputs.title }}
+          DIR: ${{ steps.release.outputs.dir }}
+        run: |
+          set -euo pipefail
+          CURRENT=$(grep -m1 '^version *=' "marketplace/${DIR}/orax.toml" 2>/dev/null | sed -E 's/^version *= *"(.*)"/\1/' || true)
+          if [ "$CURRENT" = "$VERSION" ]; then
+            echo "the marketplace already publishes ${TITLE} ${TAG}"
+            exit 0
+          fi
+          # A registry entry ahead of the newest release is not a state this workflow can have
+          # produced, and quietly proposing a downgrade would be worse than stopping.
+          if [ -n "$CURRENT" ]; then
+            NEWEST=$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | tail -1)
+            if [ "$NEWEST" != "$VERSION" ]; then
+              echo "::error::the marketplace publishes ${CURRENT}, which is ahead of the latest release ${VERSION}"
+              exit 1
+            fi
+          fi
+
+          BRANCH="release/${ID}"
+          cd marketplace
+          git checkout -B "$BRANCH"
+          mkdir -p "$DIR"
+          cp ../dist/manifest.toml "${DIR}/orax.toml"
+          cp ../README.md "${DIR}/README.md"
+          cp ../logo.svg "${DIR}/logo.svg"
+          git add "$DIR"
+          if git diff --cached --quiet; then
+            echo "the marketplace entry is already identical to ${TAG}"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: update ${TITLE} to ${TAG}"
+          git push --force origin "$BRANCH"
+
+          SUBJECT="chore: update ${TITLE} to ${TAG}"
+          BODY=$(printf '%s\n\n%s\n\n%s\n' \
+            "Publishes \`${ID}\` ${TAG}, from [that release](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG})." \
+            "\`orax.toml\` is the release's own \`manifest.toml\` copied verbatim, so the per-target download URLs and SHA-256 digests are the ones the release workflow recorded for the artifacts it published. \`README.md\` and \`logo.svg\` are copied from the plugin repository at that tag." \
+            "Opened automatically by \`.github/workflows/marketplace.yml\`.")
+
+          NUMBER=$(gh pr list --repo ora-space/marketplace --state open --head "$BRANCH" --json number --jq '.[0].number // empty')
+          if [ -z "$NUMBER" ]; then
+            NUMBER=$(gh pr create --repo ora-space/marketplace --base main --head "$BRANCH" \
+              --title "$SUBJECT" --body "$BODY")
+          else
+            gh pr edit "$NUMBER" --repo ora-space/marketplace --title "$SUBJECT" --body "$BODY"
+          fi
+          echo "${TITLE}: ${CURRENT:-none} -> ${TAG} — ${NUMBER}" >> "$GITHUB_STEP_SUMMARY"
